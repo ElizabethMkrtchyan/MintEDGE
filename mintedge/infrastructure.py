@@ -2,9 +2,12 @@ import math
 from typing import Dict, List, Optional
 
 import networkx as nx
-import simpy
+from simpy.core import Environment
+from simpy.events import Event
 from tqdm import tqdm
+from multipledispatch import dispatch
 
+import settings
 from mintedge import (
     EnergyAware,
     EnergyMeasurement,
@@ -14,6 +17,12 @@ from mintedge import (
     Service,
     User,
 )
+
+
+class MintEDGEInfrastructureError(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
 
 
 class EdgeServer(EnergyAware):
@@ -36,20 +45,22 @@ class EdgeServer(EnergyAware):
 
     def __init__(
         self,
-        env: simpy.Environment,
+        env: Environment,
         name: str,
-        max_cap: float,
+        max_cap: int,
         idle_power: int,
-        max_power: Optional[int] = None,
+        max_power: int,
         boot_time: Optional[int] = None,
     ):
         """This class represents an edge server in the infrastructure.
 
         Args:
+            env (Environment): The simulation environment.
             name (str): Friendly name of the edge server
-            max_cap (float): Maximum processing capacity in ops per second
+            max_cap (int): Maximum processing capacity in ops per second
             idle_power (int): Power consumed by the edge server when it is idle
             max_power (int, optional): Power consumed at 100% utilization
+            boot_time (int, optional): Time it takes to boot the server
         """
         self.env = env
         self.name = name
@@ -62,8 +73,8 @@ class EdgeServer(EnergyAware):
         self.op_energy = (max_power - idle_power) / max_cap
         self.energy_model = EnergyModelServer()
         self.energy_model.set_parent(self)
-        self.allocated_ops_bs_a: Dict[BaseStation, Dict[Service, int]] = {}
-        self.used_ops_bs_a: Dict[BaseStation, Dict[Service, int]] = {}
+        self.allocated_ops_bs_a: Dict[str, Dict[str, int]] = {}
+        self.used_ops_bs_a: Dict[str, Dict[str, int]] = {}
         self.boot_time = boot_time
         self.last_onoff_time = 0
 
@@ -199,10 +210,13 @@ class EdgeServer(EnergyAware):
             req (int): Number of requests made by the base station
         """
 
-        try:
-            self.allocated_ops_bs_a[src.name][a.name] = math.floor(
-                req * a.workload
+        if req < 0:
+            raise MintEDGEInfrastructureError(
+                "Cannot allocate resources for negative number of requests."
             )
+
+        try:
+            self.allocated_ops_bs_a[src.name][a.name] = math.floor(req * a.workload)
         except KeyError:
             try:
                 self.allocated_ops_bs_a[src.name] = {
@@ -217,13 +231,8 @@ class EdgeServer(EnergyAware):
             sum(a.values()) for a in self.allocated_ops_bs_a.values()
         )
         if math.floor(req * a.workload) > self.max_cap:
-            raise Exception(
+            raise MintEDGEInfrastructureError(
                 f"Cannot allocate {math.floor(req * a.workload)} requests on server {self.name} for {src.name},{a.name}."
-            )
-
-        if req < 0:
-            raise Exception(
-                f"Cannot allocate resources for negative number of requests. Something's wrong somewhere else."
             )
 
 
@@ -253,6 +262,44 @@ class BaseStation:
     def __repr__(self):
         return self.name
 
+    def get_user_rate(self, user) -> float:
+        """Per-user PHY rate in bps based on distance (Shannon-like).
+        If no users are connected, returns the BS rate. Floors at 1 Mbps
+        to avoid zero. Uses a log-distance (dB) SNR model with reference
+        distance.
+        Args:
+            user (User): The user for whom the rate is being calculated.
+        Returns:
+            float: The rate for the user in bps.
+        """
+        if not self.users:
+            return self.rate
+
+        # Distance between the user and the BS
+        dist = self.location.distance(user.location)
+        d0 = 1.0  # reference distance in meters
+        dist = max(dist, d0)  # Clamp to 1 meter to avoid zero or negative
+
+        # Avoid division by zero
+        if dist == 0:
+            return self.rate
+
+        # SNR as a function of distance (free space path loss model); clamp to tiny positive
+        snr_db = settings.SNR0_DB - 10.0 * settings.PATHLOSS_EXPONENT * math.log10(
+            dist / d0
+        )
+
+        snr_linear = 10 ** (snr_db / 10.0)
+
+        # Shannon-like spectral efficiency
+        se_bps_per_hz = math.log2(1.0 + snr_linear)
+
+        # Raw capacity then cap & floor
+        raw_rate = settings.BS_BANDWIDTH * se_bps_per_hz  # bps
+
+        return max(raw_rate, settings.MIN_USER_RATE)
+
+    @dispatch(int)
     def get_delay(self, input_size: int) -> float:
         """Returns the RAN delay of a request made in this Base Station in
         milliseconds.
@@ -262,7 +309,20 @@ class BaseStation:
             float: The RAN delay of a request made in this Base Station in
                 seconds.
         """
-        return input_size / (self.rate * 1000 * 1000)
+        return input_size / self.rate
+
+    @dispatch(User, int)
+    def get_delay(self, user: User, input_size: int) -> float:
+        """Returns the RAN delay of a request made in this Base Station in
+        milliseconds.
+        Args:
+            user (User): The user for whom the delay is being calculated.
+            input_size (int): The size of the request in bits.
+        Return:
+            float: The RAN delay of a request made in this Base Station in
+                seconds.
+        """
+        return input_size / self.get_user_rate(user)
 
     def set_edge_server(self, edge_server: EdgeServer):
         """Sets the edge server connected to this BS.
@@ -283,9 +343,7 @@ class Link(EnergyAware):
         "energy_model",
     ]
 
-    def __init__(
-        self, src: BaseStation, dst: BaseStation, cap: float, sigma: float
-    ):
+    def __init__(self, src: BaseStation, dst: BaseStation, cap: float, sigma: float):
         """A network link connecting base stations
 
         Args:
@@ -335,43 +393,44 @@ class Link(EnergyAware):
         """
         new_capacity = self.used_capacity + bps
         if new_capacity > self.capacity:
-            raise Exception(
+            raise MintEDGEInfrastructureError(
                 f"Link {self.src.name},{self.dst.name} capacity exceeded by {new_capacity - self.capacity}."
             )
         self.used_capacity += bps
 
     def release_bps(self, bps: int):
         """Rleases bps bits in the link.
+
         Args:
             bps (int): The capacity to be released in bps.
         """
         new_capacity = self.used_capacity - bps
         if new_capacity < 0:
-            raise Exception(
+            raise MintEDGEInfrastructureError(
                 f"Trying to release {bps} but only {self.used_capacity} is in use."
             )
         self.used_capacity -= bps
 
     def allocate_capacity(self, bps: int):
         """Allocates bps bits in the link.
+
         Args:
             bps (int): The capacity to be allocated in bps.
         """
         new_capacity = self.allocated_capacity + bps
         if new_capacity > self.capacity:
-            raise Exception(
+            raise MintEDGEInfrastructureError(
                 f"Link {self.src.name},{self.dst.name} capacity exceeded. Capacity:{self.capacity}, Allocated:{self.allocated_capacity}, Requested:{bps}"
             )
         self.allocated_capacity = bps
 
     def check_capacity(self, bps: int):
         """Checks if bps bits can be allocated in the link.
+
         Args:
             bps (int): The capacity to be allocated in bps.
         """
-        if self.used_capacity + bps > self.capacity:
-            return False
-        return True
+        return self.used_capacity + bps <= self.capacity
 
     def __repr__(self):
         return f"({self.src.name},{self.dst.name})"
@@ -391,13 +450,13 @@ class Infrastructure:
         "kpis",
     ]
 
-    def __init__(self, env: simpy.Environment):
+    def __init__(self, env: Environment):
         """Infrastructure graph of the simulated scenario.
         The infrastructure is multigraph G of BS and Links.
         Base Stations may or may not have Edge servers
 
         Args:
-            env (simpy.Environment): The simulation environment.
+            env (Environment): The simulation environment.
         """
         self.env = env  # Simulation environment
         self.bss = {}  # Base Stations
@@ -426,13 +485,9 @@ class Infrastructure:
             location (Location): The (x,y) coordinates of the BS.
         """
         self.bss[name] = BaseStation(name, rate, edge_server, location)
-        self.nxgraph.add_node(
-            self.bss[name], location=location, bs=self.bss[name]
-        )
+        self.nxgraph.add_node(self.bss[name], location=location, bs=self.bss[name])
 
-    def add_link(
-        self, src: BaseStation, dst: BaseStation, capacity: int, sigma: float
-    ):
+    def add_link(self, src: BaseStation, dst: BaseStation, capacity: int, sigma: float):
         """Adds a link to the infrastructure
 
         Args:
@@ -476,7 +531,7 @@ class Infrastructure:
         Returns:
             True if the server is isolated, False otherwise.
         """
-        return len(list(self.nxgraph.neighbors(bs))) == 0
+        return not list(self.nxgraph.neighbors(bs))
 
     def get_path_sigma(self, path: List[Link]) -> float:
         """Returns the total energy consumed by each bit transmitted through
@@ -529,20 +584,19 @@ class Infrastructure:
             user.bs.users.append(user)
 
     def send_requests(
-        self, env: simpy.Environment, src: BaseStation, serv: str, req: int
-    ) -> List[simpy.Event]:
+        self, env: Environment, src: BaseStation, serv: str, req: int
+    ) -> List[Event]:
         """Receives requests from users and allocates capacity to them.
 
         Args:
-            env (simpy.Environment): The simulation environment.
+            env (Environment): The simulation environment.
             src (BaseStation): Source Base Station.
             serv (str): Service that is being requested.
             req (int): Number of requests that need allocation.
 
         Returns:
-            List[simpy.Event]: List of events that are triggered when the
-                requests have been completely attended (and its capacity
-                can be released)
+            List[Event]: List of events that are triggered when the requests
+                have been completely attended (and its capacity can be released)
         """
 
         if env.now not in self.kpis:
@@ -568,10 +622,7 @@ class Infrastructure:
                 path = self.paths[(src.name, dst)]
                 bps = math.ceil(
                     fitting_req
-                    * (
-                        self.services[serv].input_size
-                        + self.services[serv].output_size
-                    )
+                    * (self.services[serv].input_size + self.services[serv].output_size)
                 )
                 self._allocate_path_capacity(path, bps)
 
@@ -585,9 +636,7 @@ class Infrastructure:
             # create a process to eliminate the requests after they are attended
             events.append(
                 env.process(
-                    self._complete_req(
-                        env, src, self.bss[dst], serv, fitting_req
-                    )
+                    self._complete_req(env, src, self.bss[dst], serv, fitting_req)
                 )
             )
             # Register servers' utilization
@@ -597,9 +646,7 @@ class Infrastructure:
         if attended_req < req - 1:  # missing one is fine. Rounding errors.
             src_a = f"{src}_{serv}"
             if f"rejected_req_{src_a}" in self.kpis[env.now]:
-                self.kpis[env.now][f"rejected_req_{src_a}"] += (
-                    req - attended_req
-                )
+                self.kpis[env.now][f"rejected_req_{src_a}"] += req - attended_req
             else:
                 self.kpis[env.now][f"rejected_req_{src_a}"] = req - attended_req
 
@@ -611,7 +658,7 @@ class Infrastructure:
 
     def _reject_requests(
         self,
-        env: simpy.Environment,
+        env: Environment,
         src: BaseStation,
         dst: str,
         serv: str,
@@ -620,7 +667,7 @@ class Infrastructure:
         """Rejects requests that do not fit in the server or in the backhaul.
 
         Args:
-            env (simpy.Environment): Simulation environment.
+            env (Environment): Simulation environment.
             src (BaseStation): Base Station where the requests were received.
             dst (str): Base Station where the server that attended the
                 requests is.
@@ -631,16 +678,10 @@ class Infrastructure:
             Tuple[int, int]: Number of requests attended and
                 number of rejected requests.
         """
-        # Reject requests if they do not fit in the server
-        rejected_s = 0
-        avail_cap = self.bss[dst].server.get_avail_cap_bs_serv(
-            src, self.services[serv]
-        )
+        avail_cap = self.bss[dst].server.get_avail_cap_bs_serv(src, self.services[serv])
         fitting_req = math.floor(avail_cap / self.services[serv].workload)
 
-        if fitting_req < total_req:
-            rejected_s = total_req - fitting_req
-
+        rejected_s = total_req - fitting_req if fitting_req < total_req else 0
         # Reject requests if they do not fit in the backhaul
         rejected_l = 0
         if dst != src.name:
@@ -648,10 +689,7 @@ class Infrastructure:
 
             fitting_req_l = round(
                 avail_cap
-                / (
-                    self.services[serv].input_size
-                    + self.services[serv].output_size
-                )
+                / (self.services[serv].input_size + self.services[serv].output_size)
             )
             if fitting_req_l < fitting_req:
                 rejected_l = fitting_req - fitting_req_l
@@ -660,9 +698,7 @@ class Infrastructure:
         self._register_rejections(env, src, serv, rejected)
         return total_req - rejected, rejected
 
-    def _compute_delays(
-        self, src: BaseStation, dst: BaseStation, a: str, req: int
-    ):
+    def _compute_delays(self, src: BaseStation, dst: BaseStation, a: str, req: int):
         """Computes the delays of a batch of requests sent to the same BS at
         the same time and attended by the same edge server. The delays are
         added to the KPIs dictionary.
@@ -676,8 +712,19 @@ class Infrastructure:
         if self.env.now not in self.kpis:
             self.kpis[self.env.now] = {}
         # Track delays
-        t_u = src.get_delay(self.services[a].input_size)  # RAN delay
-        # Backhaul delay
+        # t_u = src.get_delay(self.services[a].input_size)  # RAN delay
+        # --- Per-user RAN input delay (only users requesting service 'a') ---
+        active_users_src = [u for u in src.users if u.lmbda.get(a, 0) > 0]
+        if active_users_src:
+            per_user_delays = [
+                src.get_delay(u, self.services[a].input_size) for u in active_users_src
+            ]
+            t_u = sum(per_user_delays) / len(per_user_delays)
+        else:
+            # fallback if no user-specific info
+            t_u = src.get_delay(self.services[a].input_size)
+
+        # --- Backhaul delays ---
         if dst == src:
             t_r = 0
             t_o = 0
@@ -685,17 +732,29 @@ class Infrastructure:
             t_r = self.get_path_delay(src, dst, self.services[a])
             t_o = self.get_path_out_delay(dst, src, self.services[a])
 
-        t_c = dst.server.get_delay(
-            self.beta[a][dst.name], self.services[a]
-        )  # Compute delay
-        t_d = dst.get_delay(self.services[a].output_size)  # RAN output delay
-        delay = round(t_u + t_r + t_c + t_o + t_d, 5)
+        # --- Computing delay ---
+        t_c = dst.server.get_delay(self.beta[a][dst.name], self.services[a])
 
+        # t_d = dst.get_delay(self.services[a].output_size)  # RAN output delay
+        # --- Per-user RAN output delay (only users at dst requesting service 'a') ---
+        active_users_dst = [u for u in dst.users if u.lmbda.get(a, 0) > 0]
+        if active_users_dst:
+            per_user_out_delays = [
+                dst.get_delay(u, self.services[a].output_size) for u in active_users_dst
+            ]
+            t_d = sum(per_user_out_delays) / len(per_user_out_delays)
+        else:
+            t_d = dst.get_delay(self.services[a].output_size)
+
+        # --- Total delay ---
+        delay = round(t_u + t_r + t_c + t_o + t_d, 5)  # round to save storage space
+
+        # --- KPI registration ---
         if delay > self.services[a].max_delay:
             try:
-                self.kpis[self.env.now]["unsatisf_req_" + a] += req
+                self.kpis[self.env.now][f"unsatisf_req_{a}"] += req
             except KeyError:
-                self.kpis[self.env.now]["unsatisf_req_" + a] = req
+                self.kpis[self.env.now][f"unsatisf_req_{a}"] = req
         try:
             if delay > self.kpis[f"max_delay_{src.name}_{a}"]:
                 self.kpis[self.env.now][f"max_delay_{src.name}_{a}"] = delay
@@ -709,7 +768,7 @@ class Infrastructure:
 
     def _complete_req(
         self,
-        env: simpy.Environment,
+        env: Environment,
         src: BaseStation,
         dst: BaseStation,
         a: str,
@@ -740,19 +799,17 @@ class Infrastructure:
         if dst != src:
             # Release resources in the backhaul
             path = self.paths[(src.name, dst.name)]
-            bps = req * (
-                self.services[a].input_size + self.services[a].output_size
-            )
+            bps = req * (self.services[a].input_size + self.services[a].output_size)
             self._release_path_capacity(path, bps)
 
     def _register_requests(
-        self, env: simpy.Environment, src: BaseStation, serv: str, req: int
+        self, env: Environment, src: BaseStation, serv: str, req: int
     ):
         """Register the total number of requests in this time step in
         the KPIs dictionary.
 
         Args:
-            env (simpy.Environment): Simulation environment.
+            env (Environment): Simulation environment.
             src (BaseStation): Source base station (where the requests were
                 received).
             serv (str): Service name.
@@ -774,12 +831,12 @@ class Infrastructure:
             self.kpis[env.now]["total_requests"] = req
 
     def _register_rejections(
-        self, env: simpy.Environment, src: BaseStation, serv: str, rej: int
+        self, env: Environment, src: BaseStation, serv: str, rej: int
     ):
         """Register the number of rejected requests in the KPIs dictionary.
 
         Args:
-            env (simpy.Environment): Simulation environment.
+            env (Environment): Simulation environment.
             src (BaseStation): Source base station (where the requests
                 were received)
             serv (str): Service name.
@@ -790,33 +847,33 @@ class Infrastructure:
 
         src_a = f"{src}_{serv}"
         if f"rejected_req_{src_a}" in self.kpis[env.now]:
-            self.kpis[env.now][f"rejected_req_{src_a}"] += rej
+            self.kpis[env.now][f"rejected_req_{src_a}"] += int(rej)
         else:
-            self.kpis[env.now][f"rejected_req_{src_a}"] = rej
+            self.kpis[env.now][f"rejected_req_{src_a}"] = int(rej)
 
         if "total_rejected" in self.kpis[env.now]:
-            self.kpis[env.now]["total_rejected"] += rej
+            self.kpis[env.now]["total_rejected"] += int(rej)
         else:
-            self.kpis[env.now]["total_rejected"] = rej
+            self.kpis[env.now]["total_rejected"] = int(rej)
 
-    def _register_server_utilization(self, env: simpy.Environment, dst: str):
+    def _register_server_utilization(self, env: Environment, dst: str):
         """Save the current server utilization in the KPIs dictionary.
 
         Args:
-            env (simpy.Environment): Simulation environment.
+            env (Environment): Simulation environment.
             dst (str): Name of the destination base station.
         """
         if self.bss[dst].server is not None:
             try:
-                self.kpis[env.now]["server_util_" + dst] = round(
+                self.kpis[env.now][f"server_util_{dst}"] = round(
                     max(
                         self.bss[dst].server.get_utilization(),
-                        self.kpis[env.now]["server_util_" + dst],
+                        self.kpis[env.now][f"server_util_{dst}"],
                     ),
                     4,
                 )
             except KeyError:
-                self.kpis[env.now]["server_util_" + dst] = round(
+                self.kpis[env.now][f"server_util_{dst}"] = round(
                     self.bss[dst].server.get_utilization(), 4
                 )
 
@@ -840,9 +897,7 @@ class Infrastructure:
         for link in path:
             link.release_bps(bps)
 
-    def get_path_delay(
-        self, src: BaseStation, dst: BaseStation, a: Service
-    ) -> float:
+    def get_path_delay(self, src: BaseStation, dst: BaseStation, a: Service) -> float:
         """Returns the total delay of a path.
 
         Args:
@@ -855,8 +910,7 @@ class Infrastructure:
         if src == dst:
             return 0
         return sum(
-            link.get_delay(a.input_size)
-            for link in self.paths[(src.name, dst.name)]
+            link.get_delay(a.input_size) for link in self.paths[(src.name, dst.name)]
         )
 
     def get_path_out_delay(

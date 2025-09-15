@@ -1,15 +1,12 @@
-import atexit
+import contextlib
 import itertools
 import math
-import os
-import shutil
 import statistics as stats
-import tempfile
-import uuid
-from typing import Dict
+import pandas as pd
 
-import pysos
-import simpy
+from typing import Dict, Optional, Union
+from pathlib import Path
+from simpy.core import Environment
 
 import settings
 from mintedge import (
@@ -33,7 +30,9 @@ class Orchestrator:
         "max_lmbda",
         "predictor",
         "alloc_strategy",
-        "measurements",
+        "kpis",
+        "results_path",
+        "latest_kpis",
         "em_servers",
         "em_links",
     ]
@@ -42,7 +41,8 @@ class Orchestrator:
         self,
         infr: Infrastructure,
         mob_mngr: MobilityManager,
-        env: simpy.Environment,
+        env: Environment,
+        results_path: Path,
     ):
         """Orchestrator responsible for allocating resources on the infrastructure
         Args:
@@ -60,36 +60,28 @@ class Orchestrator:
         self.alloc_strategy = AllocationStrategy(infr)
 
         # KPI related
-        temp_dir = tempfile.mkdtemp()
-        # Register a function to delete the temporary directory at exit
-        atexit.register(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
-        filename = uuid.uuid4().hex
-        file_path = os.path.join(temp_dir, f"{filename}.json")
-        self.measurements = pysos.Dict(file_path)
-        self._initialize_measurements()
+        self.kpis = self._initialize_measurements()
+        self.results_path = results_path
+        self.latest_kpis = self._initialize_measurements()
 
         # Energy meters
         self.em_servers = EnergyMeter(
             [bs.server for bs in infr.bss.values() if bs.server is not None],
             "servers",
-            settings.ENERGY_MEASUREMENT_INTERVAL,
+            settings.MEASUREMENT_INTERVAL,
         )
 
-        self.em_links = EnergyMeter(
-            infr.links,
-            "links",
-            settings.ENERGY_MEASUREMENT_INTERVAL,
-        )
+        self.em_links = EnergyMeter(infr.links, "links", settings.MEASUREMENT_INTERVAL)
 
         # Run energy meters processes
         env.process(self.em_servers.run(env))
         env.process(self.em_links.run(env))
 
-    def run(self, env: simpy.Environment):
+    def run(self, env: Environment):
         """Starts the orchestrator process
 
         Args:
-            env (simpy.Environment): The simulation environment
+            env (Environment): The simulation environment
         """
 
         # Run orchestrator process
@@ -101,7 +93,7 @@ class Orchestrator:
             if (
                 env.now % settings.ORCHESTRATOR_INTERVAL == 0
                 or env.now == 1
-                or self._reaction_needed(env.now)
+                or self._reaction_needed()
             ):
                 # Get the maximum lambda for the next prediction interval
                 if settings.USE_PREDICTOR:
@@ -129,23 +121,32 @@ class Orchestrator:
                 self.alloc_mat = alloc_mat
 
             # Gather and store kpis
-            self.save_kpis(env.now)  # TODO: Make it more storage-efficient
+            self.save_kpis(int(env.now))
             yield env.timeout(1)
 
-    def _reaction_needed(self, time: int):
+    def _reaction_needed(self):
+        """
+        Determines if a reaction is needed based on the current measurements
+        and settings.
+
+        Returns:
+            bool: True if a reaction is needed, False otherwise.
+        """
         # Reactive allocation
         share_of_rejections = 0
-        if self.measurements[time - 1]["total_requests"] > 0:
-            share_of_rejections = (
-                self.measurements[time - 1]["total_rejected"]
-                / self.measurements[time - 1]["total_requests"]
+        try:
+            if self.latest_kpis["total_requests"].iloc[-1] > 0:
+                share_of_rejections = (
+                    self.latest_kpis["total_rejected"].iloc[-1]
+                    / self.latest_kpis["total_requests"].iloc[-1]
+                )
+            return bool(
+                (
+                    settings.REACTIVE_ALLOCATION
+                    and share_of_rejections > settings.REACTION_THRESHOLD
+                )
             )
-        if (
-            settings.REACTIVE_ALLOCATION
-            and share_of_rejections > settings.REACTION_THRESHOLD
-        ):
-            return True
-        else:
+        except IndexError:
             return False
 
     def _apply_capacity_buffer(self, demand_mat: Dict[str, Dict[str, int]]):
@@ -176,9 +177,7 @@ class Orchestrator:
         bss = self.infr.bss.values()
         servcs = self.infr.services.values()
 
-        available = sum(
-            bs.server.max_cap for bs in bss if bs.server is not None
-        )
+        available = sum(bs.server.max_cap for bs in bss if bs.server is not None)
         required = sum(
             demand_mat[bs.name][serv.name] * serv.workload
             for bs in bss
@@ -188,9 +187,7 @@ class Orchestrator:
             reject_factor = available / required
             for bs in demand_mat:
                 for serv in demand_mat[bs]:
-                    demand_mat[bs][serv] = int(
-                        demand_mat[bs][serv] * reject_factor
-                    )
+                    demand_mat[bs][serv] = int(demand_mat[bs][serv] * reject_factor)
 
         return demand_mat
 
@@ -254,12 +251,15 @@ class Orchestrator:
                     )
                     # Apply assigantion
                     if src != dst:
+                        req = math.floor(
+                            new_demand_mat[src.name][serv.name]
+                            * new_assig_mat[src.name][serv.name][dst.name]
+                        )
                         self.infr.update_backhaul_capacity(
                             src,
                             dst,
                             serv,
-                            new_demand_mat[src.name][serv.name]
-                            * new_assig_mat[src.name][serv.name][dst.name],
+                            req,
                         )
 
     def _apply_status_vector(self, new_status_vec: Dict[str, int]):
@@ -282,47 +282,78 @@ class Orchestrator:
             ):
                 dst.server.turn_on()
 
+    def _save_to_disk(self):
+        # Save to disk and clean from memory
+
+        if len(self.kpis) >= settings.ORCHESTRATOR_INTERVAL:
+            # Save to file
+            if self.results_path.exists():
+                self.kpis.to_csv(
+                    self.results_path,
+                    index=False,
+                    mode="a",
+                    header=False,
+                )
+            else:
+                self.kpis.to_csv(self.results_path, index=False)
+            # Clean from memory
+            self.kpis = self.kpis.drop(
+                self.kpis.index[: settings.ORCHESTRATOR_INTERVAL]
+            )
+
     def save_kpis(self, time: int):
         """Save KPIs of the current iteration in the measurements dataframe
 
         Args:
             time (int): Current time
         """
+
         if time == 0:
             return  # Nothing to save at time 0 (nothing has happened yet)
 
         # Initialize row with 0s
-        new_row = {k: 0 for k in self.measurements[0].keys()}
+        new_data = {
+            k: 0 for k in self.kpis.columns
+        }  # type: Dict[str, Optional[Union[int, float, None]]]
+
+        new_data["time"] = time
 
         # Get KPIs from mobility manager
-        new_row["active_users"] = self.mobility_manager.get_running_user_count()
+        new_data["active_users"] = self.mobility_manager.get_running_user_count()
 
         # Get KPIs from energy meters
-        new_row["dynamic_W_servers"] = round(
-            self.em_servers.measurmnts[-1].dynamic, 3
-        )
-        new_row["idle_W_servers"] = round(
-            self.em_servers.measurmnts[-1].idle, 3
-        )
-        new_row["W_links"] = round(self.em_links.measurmnts[-1].dynamic, 3)
+        new_data["dynamic_W_servers"] = round(self.em_servers.measurmnts[-1].dynamic, 3)
+        new_data["idle_W_servers"] = round(self.em_servers.measurmnts[-1].idle, 3)
+        new_data["W_links"] = round(self.em_links.measurmnts[-1].dynamic, 3)
 
         # Get KPIs from infrastructure
-        try:
+        with contextlib.suppress(IndexError):
             k, v = list(self.infr.kpis.items())[-1]
             for k, v in v.items():
                 if isinstance(v, list):
                     try:
                         mean = round(stats.mean(v), 5)
-                        new_row[k] = None if math.isinf(mean) else mean
+                        new_data[k] = None if math.isinf(mean) else mean
                     except stats.StatisticsError:
-                        new_row[k] = 0
+                        new_data[k] = 0
                 else:
-                    new_row[k] = None if math.isinf(v) else v
-        except IndexError:
-            pass
+                    new_data[k] = None if math.isinf(v) else v
+        # Transform dictionary to dataframe and append it to the measurements
+        new_row = pd.DataFrame.from_dict(
+            new_data, orient="index", columns=[str(self.env.now)]
+        ).T
 
-        self.measurements[self.env.now] = new_row  # Store in disk
+        if not self.kpis.empty and not new_row.empty:
+            self.kpis = pd.concat([self.kpis, new_row], ignore_index=True)
+        elif not new_row.empty:
+            self.kpis = new_row.copy()
+
+        self.latest_kpis = new_row
+
         self.infr.kpis = {}  # Reset KPIs for next iteration
+
+        # Save KPIs to disk and clean memory
+        self._save_to_disk()
 
     def initialize_assignation_matrix(
         self,
@@ -333,18 +364,14 @@ class Orchestrator:
         """
         bss = self.infr.bss
         servcs = self.infr.services
-        gamma = {
-            bsi: {ak: {bsj: 0 for bsj in bss} for ak in servcs} for bsi in bss
-        }
-        return gamma
+        return {bsi: {ak: {bsj: 0.0 for bsj in bss} for ak in servcs} for bsi in bss}
 
     def initialize_status_vector(self) -> Dict[str, int]:
         """Initialize the eta matrix
         Returns:
             Dict[str, int]: The initialized eta vector
         """
-        eta = {}
-        return eta
+        return {}
 
     def initialize_allocation_matrix(self) -> Dict[str, Dict[str, float]]:
         """Initialize the beta matrix to 0
@@ -353,26 +380,23 @@ class Orchestrator:
         """
         bss = self.infr.bss
         servcs = self.infr.services
-        beta = {ak: {bsj: 0 for bsj in bss} for ak in servcs}
-
-        return beta
+        return {ak: {bsj: 0.0 for bsj in bss} for ak in servcs}
 
     def initialize_demand_matrix(self) -> Dict[str, Dict[str, int]]:
         """Initialize the lmbda matrix to 0
         Returns:
             Dict[str, Dict[str, int]]: The initialized lmbda matrix
         """
-        return {
-            bs: {ak: 0 for ak in self.infr.services} for bs in self.infr.bss
-        }
+        return {bs: {ak: 0 for ak in self.infr.services} for bs in self.infr.bss}
 
-    def _initialize_measurements(self):
+    def _initialize_measurements(self) -> pd.DataFrame:
         """Initialize the measurements dictionary"""
         services = self.infr.services
         bss = self.infr.bss
 
         kpis = (
             [
+                "time",
                 "active_users",
                 "dynamic_W_servers",
                 "idle_W_servers",
@@ -392,5 +416,4 @@ class Orchestrator:
             ]
         )
 
-        init = {k: 0 for k in kpis}
-        self.measurements[0] = init
+        return pd.DataFrame(columns=kpis)
