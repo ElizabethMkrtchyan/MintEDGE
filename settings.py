@@ -50,7 +50,7 @@ ROUTES_FILE = "./scenario/Luxembourg.rou.xml"
 
 # The number of cars, pedestrians and stationary users is only considered if
 # RANDOM_ROUTES is True
-NUMBER_OF_CARS = 8000
+NUMBER_OF_CARS = 2000
 NUMBER_OF_PEOPLE = 2000
 NUMBER_OF_STATIONARY = 700
 
@@ -73,7 +73,7 @@ BS_DATARATE = BS_BANDWIDTH * np.log2(1.0 + SNR0_LIN)
 
 """BACKHAUL"""
 W_PER_BIT = 5.9e-9  # 5.9 nJ/bit
-MAX_LINK_CAPACITY = 3e9  # 10 Gbps
+MAX_LINK_CAPACITY = 3e8  # 10 Gbps
 
 """EDGE SERVERS"""
 SHARE_OF_SERVERS = 0.10
@@ -88,7 +88,7 @@ SERVERS = [
     {  # HP ProLiant DL380a Gen11 Intel Xeon Platinum 8480+ 2.0 GHz
         "MAX_POWER": 696,
         "IDLE_POWER": 222,
-        "MAX_CAPACITY": 11260532,
+        "MAX_CAPACITY": 6e6,
         "BOOT_TIME": 20,
     },
     # {  # FUJITSU Server PRIMERGY CX2560 M7 PRIMERGY CX400 M6
@@ -111,7 +111,7 @@ SERVICES = [
     # CONNECTED VEHICLES
     Service("connected_vehicles", 14000, 18, 1600, 100, 5e-3),
     # AUGMENTED REALITY
-    Service("augmented_reality", 50000, 1.2, 1500 * 1024, 25 * 1024, 15e-3),
+    Service("augmented_reality", 50000, 6.0, 1500 * 1024, 25 * 1024, 15e-3),
     # VIDEO ANALYSIS
     Service("video_analysis", 30000, 9, 1500 * 1024, 20, 30e-3),
 ]
