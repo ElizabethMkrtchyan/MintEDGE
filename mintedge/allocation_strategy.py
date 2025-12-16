@@ -31,6 +31,25 @@ class AllocationStrategy:
         """
         self.infr = infr
 
+        # --- Heuristic weights (tune in experiments) ---
+        # We score candidate servers using normalized terms:
+        #   delay term: (transport + estimated compute) / max_delay
+        #   energy term: (server + network energy per request) / typical_energy
+        #   util term: current utilization estimate in [0,1]
+        #   congestion term: backhaul bottleneck usage in [0,1]
+        # The defaults emphasize meeting delay budgets first.
+        self.w_delay = 0.55
+        self.w_energy = 0.25
+        self.w_util = 0.15
+        self.w_cong = 0.05
+
+        # Energy normalization (nJ scale avoids tiny floats). If you change
+        # server/link models, re-tune this constant.
+        self._typical_energy_per_req = 5e-3  # Joule (heuristic)
+
+        # Optional consolidation: turn off servers with zero assigned load.
+        self.enable_consolidation = True
+
     def get_allocation(self, demand_matrix: Dict[str, Dict[str, int]]):
         """Allocate resources on the infrastructure in a greedy manner
         (closer first)
@@ -73,7 +92,7 @@ class AllocationStrategy:
         if total_demand > total_capacity:
             raise MintEDGEAllocationError("Not enough capacity")
 
-        # Main loop
+        # Main loop (route each (src, service) demand to feasible servers)
         for src, serv in tqdm(
             itertools.product(infr.bss.values(), infr.services.values()),
             leave=False,
@@ -86,8 +105,16 @@ class AllocationStrategy:
             # Requests to route this iteration
             req_to_locate = demand_matrix[src.name][serv.name]
 
-            # Get servers that can attend the requests within the constraints
+            # Get feasible servers (deadline/constraints) then sort by score.
             cand = self._get_cand_servers(server_status, src, serv)
+            cand = self._sort_candidates(
+                cand,
+                src,
+                serv,
+                demand_matrix,
+                assig_matrix,
+                used_cap,
+            )
             # Reroute requests
             assig_matrix, req_to_locate, used_cap, _ = self._route(
                 cand,
@@ -99,11 +126,96 @@ class AllocationStrategy:
                 used_cap,
             )
 
-        alloc_matrix = self._calculate_cpu_alloc_matrix(
-            demand_matrix, assig_matrix, infr
-        )
+        # Optional: consolidate (switch off servers that received no load)
+        if self.enable_consolidation:
+            for bs in infr.bss.values():
+                if bs.server is None:
+                    continue
+                if used_cap[bs.name] == 0:
+                    server_status[bs.name] = 0
+
+        alloc_matrix = self._calculate_cpu_alloc_matrix(demand_matrix, assig_matrix, infr)
 
         return server_status, assig_matrix, alloc_matrix
+
+    def _sort_candidates(
+        self,
+        candidates: List[BaseStation],
+        src: BaseStation,
+        serv: Service,
+        demand_mat: Dict[str, Dict[str, int]],
+        assig_mat: Dict[str, Dict[str, Dict[str, float]]],
+        used_cap: Dict[str, int],
+    ) -> List[BaseStation]:
+        """Sort feasible candidates by a multi-objective score (lower is better)."""
+
+        def score(dst: BaseStation) -> float:
+            # Transport delay (RAN + backhaul in/out)
+            t_trans = self._calculate_transport_delay(src, serv, dst)
+
+            # Remaining compute cap in ops/s (heuristic; ignores per-service splits)
+            avail_ops = max(dst.server.max_cap - used_cap[dst.name], 0)  # type: ignore
+            # Estimated compute delay for *one* request (seconds)
+            if avail_ops <= 0:
+                t_comp = math.inf
+            else:
+                # Service time ~ workload / available processing rate
+                t_comp = serv.workload / avail_ops
+
+            # Guard: if the (rough) end-to-end delay estimate violates the budget,
+            # deprioritize completely.
+            if (t_trans + t_comp) > serv.max_delay:
+                return math.inf
+
+            # Backhaul congestion on bottleneck link in the path
+            path = self.infr.paths[(src.name, dst.name)]
+            alpha = self._calculate_alpha(demand_mat, assig_mat, path)
+            path_cap = min((link.capacity for link in path), default=math.inf)
+            cong = 0.0
+            if path_cap not in (0, math.inf):
+                cong = max(0.0, min(1.0, 1.0 - (alpha / path_cap)))
+
+            # Energy per request (server dynamic + network per-bit)
+            e_server = serv.workload * dst.server.op_energy  # type: ignore
+            e_net = (serv.input_size + serv.output_size) * self.infr.get_path_sigma(path)
+            e_req = e_server + e_net
+
+            # Utilization estimate (before placing this demand)
+            util = 0.0
+            if dst.server.max_cap > 0:  # type: ignore
+                util = max(0.0, min(1.0, used_cap[dst.name] / dst.server.max_cap))  # type: ignore
+
+            # Normalized terms
+            delay_term = (t_trans + t_comp) / max(serv.max_delay, 1e-9)
+            energy_term = e_req / max(self._typical_energy_per_req, 1e-12)
+
+            return (
+                self.w_delay * delay_term
+                + self.w_energy * energy_term
+                + self.w_util * util
+                + self.w_cong * cong
+            )
+
+        return sorted(candidates, key=score)
+
+
+class GreedyClosestAllocationStrategy(AllocationStrategy):
+    """Baseline: assign to the geographically closest feasible server first.
+
+    This matches the baseline requested in the project description ("closest server").
+    It reuses the same routing and CPU allocation calculations.
+    """
+
+    def _sort_candidates(
+        self,
+        candidates: List[BaseStation],
+        src: BaseStation,
+        serv: Service,
+        demand_mat: Dict[str, Dict[str, int]],
+        assig_mat: Dict[str, Dict[str, Dict[str, float]]],
+        used_cap: Dict[str, int],
+    ) -> List[BaseStation]:
+        return sorted(candidates, key=lambda dst: src.location.distance(dst.location))
 
     def _route(
         self,
@@ -273,9 +385,6 @@ class AllocationStrategy:
 
                 if t_r < rem_delay_budget:
                     cand_servers += [dst]
-        # Order the servers according to the sigma of their paths
-        cand_servers = self.sort_servers_by_sigma(cand_servers, src, self.infr)
-
         return cand_servers
 
     def sort_servers_by_sigma(
