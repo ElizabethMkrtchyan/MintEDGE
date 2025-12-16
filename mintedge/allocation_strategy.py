@@ -20,8 +20,6 @@ class MintEDGEAllocationError(Exception):
 
 
 class AllocationStrategy:
-    __slots__ = ["infr"]
-
     def __init__(self, infr: Infrastructure):
         """Algorithm responsible to allocate resources and assign
         computing requests to servers
